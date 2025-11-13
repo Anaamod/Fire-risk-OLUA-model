@@ -1,0 +1,430 @@
+
+# # Forest dynamics numerical model
+
+# Literate.markdown("harvest_dynamics.jl", "."; flavor=Literate.CommonMarkFlavor(), execute=true) #src
+# p{break-inside: avoid} #src
+
+# ### Setting up the environment / packages...
+cd(@__DIR__)
+using Pkg
+Pkg.activate(".")
+#Pkg.resolve()
+#Pkg.instantiate()
+
+using Plots
+using Plots.PlotMeasures
+using Markdown
+using Revise
+using Test
+
+# ### Load the model structure (function "luc_model")
+push!(LOAD_PATH,joinpath(@__DIR__,"lib"))
+using OLUA
+
+bc_seq_c1 = 0.0
+bc_sub_c1 = 0.0
+σ = OLUA.σ
+
+# Damage scenario
+damage_rate = 0.7
+tdamage     = 40 # for simplicity, always rounded to the nearest 5 year
+
+fvars    = Dict{String,Float64}("d" => 0.0)
+standard_options = (fvars=fvars, d₀ = 0.0, r_F₀ = 0.0, bc_seq_c1 = 0.0, bc_sub_c1=0.0, benv_c1=0.0) #, σ=0.0) #src
+base     = luc_model(;standard_options...) 
+ix       = 2:(length(base.support)-320) # index for plotting (we discard the distant future and the first year that is not part of the optimization)
+times    = base.support[ix] 
+ntpoints = length(times)
+mystep     = times[end] / (ntpoints)  # We choosen to discretize every 5 years
+
+function compute_welfare(damage_rate,tdamage,anticipations=true)
+    println("** working with: damage rate: $damage_rate - damage time: $tdamage - anticipations: $anticipations")
+    fvars    = Dict{String,Float64}("d" => 0.0)
+    standard_options = (fvars=fvars, d₀ = 0.0, r_F₀ = 0.0, bc_seq_c1 = 0.0, bc_sub_c1=0.0, benv_c1=0.0) #, σ=0.0) #src
+    full_ix      = 2:length(base.support)
+    npvwelfare = 0.0
+    if anticipations
+        out = luc_model(;damage_rate=damage_rate, tdamage=tdamage, standard_options...)
+        for ix in full_ix
+            t = base.support[ix]
+            npvwelfare += mystep*out.welfare[ix]*(1+σ)^-t
+        end
+    else
+        # Computing new state var at time of domage...
+        ix_domage = findfirst(t -> t >= tdamage, times)+1
+
+        F₀          = base.F[ix_domage]  # Initial primary-forest area
+        S₀          = base.S[ix_domage]  # Initial secondary forest area
+        A₀          = base.A[ix_domage]  # Initial agricultural area
+        V₀          = base.V[ix_domage]* (1-damage_rate)  # Initial secondary forest volumes
+        #adaptation = luc_model(bc_seq_c1=bc_seq_c1, bc_sub_c1 =bc_sub_c1, F₀=F₀, S₀=S₀, A₀=A₀, V₀=V₀, fvars=fvars) 
+        adaptation = luc_model(; F₀=F₀, S₀=S₀, A₀=A₀, V₀=V₀, h₀ = base.h[ix_domage], r_A₀ = base.r_A[ix_domage], a₀ = base.a[ix_domage],  standard_options...) 
+        #adaptation = luc_model(; F₀=F₀, S₀=S₀, A₀=A₀, V₀=V₀,  standard_options...)
+
+        range_part1 = 1:ix_domage-1
+        range_part2 = 1:length(base.support)-ix_domage+1
+
+        merged = (
+            F = vcat(base.F[range_part1],adaptation.F[range_part2]),
+            S = vcat(base.S[range_part1],adaptation.S[range_part2]),
+            A = vcat(base.A[range_part1],adaptation.A[range_part2]),
+            V = vcat(base.V[range_part1],adaptation.V[range_part2]),
+            d = vcat(base.d[range_part1],adaptation.d[range_part2]),
+            h = vcat(base.h[range_part1],adaptation.h[range_part2]),
+            r_F = vcat(base.r_F[range_part1],adaptation.r_F[range_part2]),
+            r_A = vcat(base.r_A[range_part1],adaptation.r_A[range_part2]),
+            a   = vcat(base.a[range_part1],adaptation.a[range_part2]),
+            ben_env = vcat(base.ben_env[range_part1],adaptation.ben_env[range_part2]),
+            ben_env2 = vcat(base.ben_env2[range_part1],adaptation.ben_env2[range_part2]),
+            ben_agr = vcat(base.ben_agr[range_part1],adaptation.ben_agr[range_part2]),
+            ben_wood = vcat(base.ben_wood[range_part1],adaptation.ben_wood[range_part2]),
+            ben_carbon_seq = vcat(base.ben_carbon_seq[range_part1],adaptation.ben_carbon_seq[range_part2]),
+            ben_carbon_sub = vcat(base.ben_carbon_sub[range_part1],adaptation.ben_carbon_sub[range_part2]),
+            cost_pfharv = vcat(base.cost_pfharv[range_part1],adaptation.cost_pfharv[range_part2]),
+            cost_sfharv = vcat(base.cost_sfharv[range_part1],adaptation.cost_sfharv[range_part2]),
+            cost_sfreg = vcat(base.cost_sfreg[range_part1],adaptation.cost_sfreg[range_part2]),
+            welfare = vcat(base.welfare[range_part1],adaptation.welfare[range_part2]),
+            co2_seq = vcat(base.co2_seq[range_part1],adaptation.co2_seq[range_part2]),
+            co2_sub = vcat(base.co2_sub[range_part1],adaptation.co2_sub[range_part2]),
+            pF= vcat(base.pF[range_part1],adaptation.pF[range_part2]),
+            pS= vcat(base.pS[range_part1],adaptation.pS[range_part2]),
+            pA= vcat(base.pA[range_part1],adaptation.pA[range_part2]),
+            pV= vcat(base.pV[range_part1],adaptation.pV[range_part2]),
+        )
+
+        # As in merged the damage happens out of the otimization, we need to subtract from welfare, ben_carbon_seq and co2_seq the values that are left because of the storm
+        v_damaged = merged.V[ix_domage-1]*damage_rate
+        co2_released = (v_damaged * OLUA.co2seq) / mystep # this because then wer are going to multiply each point value by the step
+        bc_seq_to_remove = bc_seq_c1*exp(OLUA.bc_seq_c2 * times[ix_domage-1]) * co2_released 
+        merged.co2_seq[ix_domage] -= 0.0 #co2_released
+        merged.ben_carbon_seq[ix_domage] -= 0 #bc_seq_to_remove
+        merged.welfare[ix_domage] -= bc_seq_to_remove
+
+        # Computation of total welfare...
+        for ix in full_ix
+            t = base.support[ix]
+            npvwelfare += mystep*merged.welfare[ix]*(1+σ)^-t
+        end
+    end
+    return npvwelfare
+end
+
+npvw = compute_welfare(0.1,40,true)
+npvw = compute_welfare(0.9,40,false)
+
+d_times = 10:5:100
+d_rates = 0.1:0.05:0.9
+
+w_fully_anticipated = [compute_welfare(dr,dt,true) for dt in d_times, dr in d_rates]
+w_merged = [compute_welfare(dr,dt,false) for dt in d_times, dr in d_rates]
+w_cost_rel = 100 .* (w_merged .- w_fully_anticipated ) ./ w_fully_anticipated 
+
+#w_cost = w_merged .- w_fully_anticipated
+
+contour(collect(d_rates), collect(d_times),  w_cost_rel, levels=300, color=:turbo, clabels=true, cbar=false, lw=1, xlabel="Damage rate",
+        ylabel="Damage time", title="Welfare loss % from non anticipation")
+
+
+ 
+        Pkg.add("CSV")
+Pkg.add("DataFrames")
+using CSV, DataFrames
+
+
+
+CSV.write("w_cost_rel.csv", DataFrame(w_cost_rel, :auto))
+
+
+######carbon benefits#######
+
+
+function compute_ben_env2(damage_rate,tdamage,anticipations=true)
+    println("** working with: damage rate: $damage_rate - damage time: $tdamage - anticipations: $anticipations")
+    fvars    = Dict{String,Float64}("d" => 0.0)
+    standard_options = (fvars=fvars, d₀ = 0.0, r_F₀ = 0.0, bc_seq_c1 = 0.0, bc_sub_c1=0.0, benv_c1=0.0) #, σ=0.0) #src
+    full_ix      = 2:length(base.support)
+    npvcarbon = 0.0
+    if anticipations
+        out = luc_model(;damage_rate=damage_rate, tdamage=tdamage, standard_options...)
+        for ix in full_ix
+            t = base.support[ix]
+            npvcarbon += mystep*out.ben_env2[ix]*(1+σ)^-t
+        end
+    else
+        # Computing new state var at time of domage...
+        ix_domage = findfirst(t -> t >= tdamage, times)+1
+
+        F₀          = base.F[ix_domage]  # Initial primary-forest area
+        S₀          = base.S[ix_domage]  # Initial secondary forest area
+        A₀          = base.A[ix_domage]  # Initial agricultural area
+        V₀          = base.V[ix_domage]* (1-damage_rate)  # Initial secondary forest volumes
+        #adaptation = luc_model(bc_seq_c1=bc_seq_c1, bc_sub_c1 =bc_sub_c1, F₀=F₀, S₀=S₀, A₀=A₀, V₀=V₀, fvars=fvars) 
+        adaptation = luc_model(; F₀=F₀, S₀=S₀, A₀=A₀, V₀=V₀, h₀ = base.h[ix_domage], r_A₀ = base.r_A[ix_domage], a₀ = base.a[ix_domage],  standard_options...) 
+        #adaptation = luc_model(; F₀=F₀, S₀=S₀, A₀=A₀, V₀=V₀,  standard_options...)
+
+        range_part1 = 1:ix_domage-1
+        range_part2 = 1:length(base.support)-ix_domage+1
+
+        merged = (
+            F = vcat(base.F[range_part1],adaptation.F[range_part2]),
+            S = vcat(base.S[range_part1],adaptation.S[range_part2]),
+            A = vcat(base.A[range_part1],adaptation.A[range_part2]),
+            V = vcat(base.V[range_part1],adaptation.V[range_part2]),
+            d = vcat(base.d[range_part1],adaptation.d[range_part2]),
+            h = vcat(base.h[range_part1],adaptation.h[range_part2]),
+            r_F = vcat(base.r_F[range_part1],adaptation.r_F[range_part2]),
+            r_A = vcat(base.r_A[range_part1],adaptation.r_A[range_part2]),
+            a   = vcat(base.a[range_part1],adaptation.a[range_part2]),
+            ben_env = vcat(base.ben_env[range_part1],adaptation.ben_env[range_part2]),
+            ben_env2 = vcat(base.ben_env2[range_part1],adaptation.ben_env2[range_part2]),
+            ben_agr = vcat(base.ben_agr[range_part1],adaptation.ben_agr[range_part2]),
+            ben_wood = vcat(base.ben_wood[range_part1],adaptation.ben_wood[range_part2]),
+            ben_carbon_seq = vcat(base.ben_carbon_seq[range_part1],adaptation.ben_carbon_seq[range_part2]),
+            ben_carbon_sub = vcat(base.ben_carbon_sub[range_part1],adaptation.ben_carbon_sub[range_part2]),
+            cost_pfharv = vcat(base.cost_pfharv[range_part1],adaptation.cost_pfharv[range_part2]),
+            cost_sfharv = vcat(base.cost_sfharv[range_part1],adaptation.cost_sfharv[range_part2]),
+            cost_sfreg = vcat(base.cost_sfreg[range_part1],adaptation.cost_sfreg[range_part2]),
+            welfare = vcat(base.welfare[range_part1],adaptation.welfare[range_part2]),
+            co2_seq = vcat(base.co2_seq[range_part1],adaptation.co2_seq[range_part2]),
+            co2_sub = vcat(base.co2_sub[range_part1],adaptation.co2_sub[range_part2]),
+            pF= vcat(base.pF[range_part1],adaptation.pF[range_part2]),
+            pS= vcat(base.pS[range_part1],adaptation.pS[range_part2]),
+            pA= vcat(base.pA[range_part1],adaptation.pA[range_part2]),
+            pV= vcat(base.pV[range_part1],adaptation.pV[range_part2]),
+        )
+
+        # As in merged the damage happens out of the otimization, we need to subtract from welfare, ben_carbon_seq and co2_seq the values that are left because of the storm
+        v_damaged = merged.V[ix_domage-1]*damage_rate
+        co2_released = (v_damaged * OLUA.co2seq) / mystep # this because then wer are going to multiply each point value by the step
+        bc_seq_to_remove = bc_seq_c1*exp(OLUA.bc_seq_c2 * times[ix_domage-1]) * co2_released 
+        merged.co2_seq[ix_domage] -= 0.0 #co2_released
+        merged.ben_carbon_seq[ix_domage] -= 0 #bc_seq_to_remove
+        merged.welfare[ix_domage] -= bc_seq_to_remove
+
+        # Computation of total welfare...
+        for ix in full_ix
+            t = base.support[ix]
+            npvcarbon += mystep*merged.ben_env2[ix]*(1+σ)^-t
+        end
+    end
+    return npvcarbon
+end
+
+npvcarbon = compute_ben_env2(0.4,20,true)
+npvcarbon = compute_ben_env2(0.4,20,false)
+
+d_times = 10:5:100
+d_rates = 0.1:0.05:0.9
+
+carb_fully_anticipated = [compute_ben_env2(dr,dt,true) for dt in d_times, dr in d_rates]
+carb_merged = [compute_ben_env2(dr,dt,false) for dt in d_times, dr in d_rates]
+carb_cost_rel = 100 .* (carb_merged .- carb_fully_anticipated ) ./ carb_fully_anticipated 
+
+#carb_cost = carb_merged .- carb_fully_anticipated
+
+contour(collect(d_rates), collect(d_times),  carb_cost_rel, levels=15, color=:turbo, clabels=true, cbar=false, lw=1, xlabel="Damage rate",
+        ylabel="Damage time", title="Carbon loss % from non anticipation")
+
+
+    using CSV
+    using DataFrames
+    
+CSV.write("carb_cost_rel1.csv", DataFrame(carb_cost_rel, :auto))
+
+####timber benefits 
+
+function compute_ben_wood(damage_rate,tdamage,anticipations=true)
+    println("** working with: damage rate: $damage_rate - damage time: $tdamage - anticipations: $anticipations")
+    fvars    = Dict{String,Float64}("d" => 0.0)
+    standard_options = (fvars=fvars, d₀ = 0.0, r_F₀ = 0.0, bc_seq_c1 = 0.0, bc_sub_c1=0.0, benv_c1=0.0) #, σ=0.0) #src
+    full_ix      = 2:length(base.support)
+    npvwood = 0.0
+    if anticipations
+        out = luc_model(;damage_rate=damage_rate, tdamage=tdamage, standard_options...)
+        for ix in full_ix
+            t = base.support[ix]
+            npvwood += mystep*out.ben_wood[ix]*(1+σ)^-t
+        end
+    else
+        # Computing new state var at time of domage...
+        ix_domage = findfirst(t -> t >= tdamage, times)+1
+
+        F₀          = base.F[ix_domage]  # Initial primary-forest area
+        S₀          = base.S[ix_domage]  # Initial secondary forest area
+        A₀          = base.A[ix_domage]  # Initial agricultural area
+        V₀          = base.V[ix_domage]* (1-damage_rate)  # Initial secondary forest volumes
+        #adaptation = luc_model(bc_seq_c1=bc_seq_c1, bc_sub_c1 =bc_sub_c1, F₀=F₀, S₀=S₀, A₀=A₀, V₀=V₀, fvars=fvars) 
+        adaptation = luc_model(; F₀=F₀, S₀=S₀, A₀=A₀, V₀=V₀, h₀ = base.h[ix_domage], r_A₀ = base.r_A[ix_domage], a₀ = base.a[ix_domage],  standard_options...) 
+        #adaptation = luc_model(; F₀=F₀, S₀=S₀, A₀=A₀, V₀=V₀,  standard_options...)
+
+        range_part1 = 1:ix_domage-1
+        range_part2 = 1:length(base.support)-ix_domage+1
+
+        merged = (
+            F = vcat(base.F[range_part1],adaptation.F[range_part2]),
+            S = vcat(base.S[range_part1],adaptation.S[range_part2]),
+            A = vcat(base.A[range_part1],adaptation.A[range_part2]),
+            V = vcat(base.V[range_part1],adaptation.V[range_part2]),
+            d = vcat(base.d[range_part1],adaptation.d[range_part2]),
+            h = vcat(base.h[range_part1],adaptation.h[range_part2]),
+            r_F = vcat(base.r_F[range_part1],adaptation.r_F[range_part2]),
+            r_A = vcat(base.r_A[range_part1],adaptation.r_A[range_part2]),
+            a   = vcat(base.a[range_part1],adaptation.a[range_part2]),
+            ben_env = vcat(base.ben_env[range_part1],adaptation.ben_env[range_part2]),
+            ben_env2 = vcat(base.ben_env2[range_part1],adaptation.ben_env2[range_part2]),
+            ben_agr = vcat(base.ben_agr[range_part1],adaptation.ben_agr[range_part2]),
+            ben_wood = vcat(base.ben_wood[range_part1],adaptation.ben_wood[range_part2]),
+            ben_carbon_seq = vcat(base.ben_carbon_seq[range_part1],adaptation.ben_carbon_seq[range_part2]),
+            ben_carbon_sub = vcat(base.ben_carbon_sub[range_part1],adaptation.ben_carbon_sub[range_part2]),
+            cost_pfharv = vcat(base.cost_pfharv[range_part1],adaptation.cost_pfharv[range_part2]),
+            cost_sfharv = vcat(base.cost_sfharv[range_part1],adaptation.cost_sfharv[range_part2]),
+            cost_sfreg = vcat(base.cost_sfreg[range_part1],adaptation.cost_sfreg[range_part2]),
+            welfare = vcat(base.welfare[range_part1],adaptation.welfare[range_part2]),
+            co2_seq = vcat(base.co2_seq[range_part1],adaptation.co2_seq[range_part2]),
+            co2_sub = vcat(base.co2_sub[range_part1],adaptation.co2_sub[range_part2]),
+            pF= vcat(base.pF[range_part1],adaptation.pF[range_part2]),
+            pS= vcat(base.pS[range_part1],adaptation.pS[range_part2]),
+            pA= vcat(base.pA[range_part1],adaptation.pA[range_part2]),
+            pV= vcat(base.pV[range_part1],adaptation.pV[range_part2]),
+        )
+
+        # As in merged the damage happens out of the otimization, we need to subtract from welfare, ben_carbon_seq and co2_seq the values that are left because of the storm
+        v_damaged = merged.V[ix_domage-1]*damage_rate
+        co2_released = (v_damaged * OLUA.co2seq) / mystep # this because then wer are going to multiply each point value by the step
+        bc_seq_to_remove = bc_seq_c1*exp(OLUA.bc_seq_c2 * times[ix_domage-1]) * co2_released 
+        merged.co2_seq[ix_domage] -= 0.0 #co2_released
+        merged.ben_carbon_seq[ix_domage] -= 0 #bc_seq_to_remove
+        merged.welfare[ix_domage] -= bc_seq_to_remove
+
+        # Computation of total welfare...
+        for ix in full_ix
+            t = base.support[ix]
+            npvwood += mystep*merged.ben_wood[ix]*(1+σ)^-t
+        end
+    end
+    return npvwood
+end
+
+npvwood = compute_ben_wood(0.6,10,true)
+npvwood = compute_ben_wood(0.6,10,false)
+
+d_times = 10:5:100
+d_rates = 0.1:0.05:0.9
+
+wood_fully_anticipated = [compute_ben_wood(dr,dt,true) for dt in d_times, dr in d_rates]
+wood_merged = [compute_ben_wood(dr,dt,false) for dt in d_times, dr in d_rates]
+wood_cost_rel = 100 .* (wood_merged .- wood_fully_anticipated ) ./ wood_fully_anticipated 
+
+#carb_cost = carb_merged .- carb_fully_anticipated
+
+contour(collect(d_rates), collect(d_times),  carb_cost_rel, levels=15, color=:turbo, clabels=true, cbar=false, lw=1, xlabel="Damage rate",
+        ylabel="Damage time", title="Carbon loss % from non anticipation")
+
+
+    using CSV
+    using DataFrames
+    
+CSV.write("wood_cost_rel.csv", DataFrame(wood_cost_rel, :auto))
+
+####other land 
+
+function compute_ben_other(damage_rate,tdamage,anticipations=true)
+    println("** working with: damage rate: $damage_rate - damage time: $tdamage - anticipations: $anticipations")
+    fvars    = Dict{String,Float64}("d" => 0.0)
+    standard_options = (fvars=fvars, d₀ = 0.0, r_F₀ = 0.0, bc_seq_c1 = 0.0, bc_sub_c1=0.0, benv_c1=0.0) 
+    full_ix      = 2:length(base.support)
+    npvother = 0.0
+    if anticipations
+        out = luc_model(;damage_rate=damage_rate, tdamage=tdamage, standard_options...)
+        for ix in full_ix
+            t = base.support[ix]
+            # compute ben_other safely
+            ben_other = 60 .* sqrt.(abs.(out.r_A[ix] + out.r_F[ix]))
+            npvother += mystep*ben_other*(1+σ)^-t
+        end
+    else
+        ix_domage = findfirst(t -> t >= tdamage, times)+1
+
+        F₀          = base.F[ix_domage]  
+        S₀          = base.S[ix_domage]  
+        A₀          = base.A[ix_domage]  
+        V₀          = base.V[ix_domage]* (1-damage_rate)  
+
+        adaptation = luc_model(; F₀=F₀, S₀=S₀, A₀=A₀, V₀=V₀, h₀ = base.h[ix_domage], r_A₀ = base.r_A[ix_domage], a₀ = base.a[ix_domage],  standard_options...) 
+
+        range_part1 = 1:ix_domage-1
+        range_part2 = 1:length(base.support)-ix_domage+1
+
+        merged = (
+            F = vcat(base.F[range_part1],adaptation.F[range_part2]),
+            S = vcat(base.S[range_part1],adaptation.S[range_part2]),
+            A = vcat(base.A[range_part1],adaptation.A[range_part2]),
+            V = vcat(base.V[range_part1],adaptation.V[range_part2]),
+            d = vcat(base.d[range_part1],adaptation.d[range_part2]),
+            h = vcat(base.h[range_part1],adaptation.h[range_part2]),
+            r_F = vcat(base.r_F[range_part1],adaptation.r_F[range_part2]),
+            r_A = vcat(base.r_A[range_part1],adaptation.r_A[range_part2]),
+            a   = vcat(base.a[range_part1],adaptation.a[range_part2]),
+            ben_env = vcat(base.ben_env[range_part1],adaptation.ben_env[range_part2]),
+            ben_env2 = vcat(base.ben_env2[range_part1],adaptation.ben_env2[range_part2]),
+            ben_agr = vcat(base.ben_agr[range_part1],adaptation.ben_agr[range_part2]),
+            ben_wood = vcat(base.ben_wood[range_part1],adaptation.ben_wood[range_part2]),
+            ben_carbon_seq = vcat(base.ben_carbon_seq[range_part1],adaptation.ben_carbon_seq[range_part2]),
+            ben_carbon_sub = vcat(base.ben_carbon_sub[range_part1],adaptation.ben_carbon_sub[range_part2]),
+            cost_pfharv = vcat(base.cost_pfharv[range_part1],adaptation.cost_pfharv[range_part2]),
+            cost_sfharv = vcat(base.cost_sfharv[range_part1],adaptation.cost_sfharv[range_part2]),
+            cost_sfreg = vcat(base.cost_sfreg[range_part1],adaptation.cost_sfreg[range_part2]),
+            welfare = vcat(base.welfare[range_part1],adaptation.welfare[range_part2]),
+            co2_seq = vcat(base.co2_seq[range_part1],adaptation.co2_seq[range_part2]),
+            co2_sub = vcat(base.co2_sub[range_part1],adaptation.co2_sub[range_part2]),
+            pF= vcat(base.pF[range_part1],adaptation.pF[range_part2]),
+            pS= vcat(base.pS[range_part1],adaptation.pS[range_part2]),
+            pA= vcat(base.pA[range_part1],adaptation.pA[range_part2]),
+            pV= vcat(base.pV[range_part1],adaptation.pV[range_part2]),
+        )
+
+        v_damaged = merged.V[ix_domage-1]*damage_rate
+        co2_released = (v_damaged * OLUA.co2seq) / mystep 
+        bc_seq_to_remove = bc_seq_c1*exp(OLUA.bc_seq_c2 * times[ix_domage-1]) * co2_released 
+        merged.co2_seq[ix_domage] -= 0.0 
+        merged.ben_carbon_seq[ix_domage] -= 0 
+        merged.welfare[ix_domage] -= bc_seq_to_remove
+
+        # use ben_other instead of ben_agr
+        for ix in full_ix
+            t = base.support[ix]
+            ben_other = 60 .* sqrt.(abs.(merged.r_A[ix] + merged.r_F[ix]))
+            npvother += mystep*ben_other*(1+σ)^-t
+        end
+    end
+    return npvother
+end
+
+
+
+npvagr = compute_ben_other(0.6,10,true)
+npvagr = compute_ben_other(0.6,10,false)
+
+d_times = 10:5:100
+d_rates = 0.1:0.05:0.9
+
+agr_fully_anticipated = [compute_ben_other(dr,dt,true) for dt in d_times, dr in d_rates]
+agr_merged = [compute_ben_other(dr,dt,false) for dt in d_times, dr in d_rates]
+agr_cost_rel = 100 .* (agr_merged .- agr_fully_anticipated ) ./ agr_fully_anticipated 
+
+
+
+
+#carb_cost = carb_merged .- carb_fully_anticipated
+
+contour(collect(d_rates), collect(d_times),  ben_other_cost_rel, levels=15, color=:turbo, clabels=true, cbar=false, lw=1, xlabel="Damage rate",
+        ylabel="Damage time", title="Carbon loss % from non anticipation")
+
+
+    using CSV
+    using DataFrames
+    
+CSV.write("OtherLand_cost.csv", DataFrame(agr_cost_rel, :auto))
+
+
+
